@@ -29,7 +29,7 @@ import type {} from '@deepseek-ai/dsh-shell'
 import type { ApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { APPROVAL_POLICIES, setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 // Type-only: resolves the required projection service and optional settings/command children.
-import type {} from '@deepseek-ai/dsh-session-projection'
+import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-commands'
 import type { PermissionCatalog, PermissionSelection, PresetOption } from './types.ts'
 
@@ -203,9 +203,15 @@ export class PermissionPresetService extends TypertRemoteService {
   private readonly presets: Record<string, PresetSpec>
   private autoAdmit: (() => void) | undefined
   private defaultSettings: () => PermissionSettings
+  private readonly permissionProjectionDefinition: ProjectionDefinition<'permissions', PermissionProjectionState> & {
+    wire: NonNullable<ProjectionDefinition<'permissions', PermissionProjectionState>['wire']>
+  }
+  private readonly readPermissionState: (session: Session) => PermissionProjectionState | undefined
 
   constructor(ctx: Context, config: Config) {
     super(ctx, 'permissionPresets')
+    const projections = ctx.sessionProjections
+    this.readPermissionState = session => projections.stateOf(session, 'permissions')
 
     ctx.inject(['settings'], (child) => { child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)) })
     // The schema defaulted the table — the cast records that runtime fact.
@@ -234,14 +240,15 @@ export class PermissionPresetService extends TypertRemoteService {
     const selectionSchema = zod.object({
       currentValue: zod.string().min(1),
     }) as zod.ZodType<PermissionSelection>
-    ctx.sessionProjections.register({
+    this.permissionProjectionDefinition = {
       key: 'permissions',
       stateVersion: 2,
       stateSchema: permissionStateSchema,
       init: () => ({ ...EMPTY_KNOBS, seeded: false }),
       apply: applyPermissionEvent,
       wire: { viewSchema: selectionSchema, view: state => ({ currentValue: this.derive(state) }) },
-    })
+    }
+    ctx.sessionProjections.register(this.permissionProjectionDefinition)
     ctx.on('session/created', (session) => {
       this.pinInitialPermission(session)
     })
@@ -305,15 +312,16 @@ export class PermissionPresetService extends TypertRemoteService {
    * @returns the async effect disposer that removes Auto.
    */
   registerAuto(admit: () => void): () => Promise<void> {
-    return this.ctx.effect(() => {
+    return this.ctx.effect(function* (this: PermissionPresetService) {
       if (this.autoAdmit !== undefined) throw new Error('permission: preset "auto" is already registered')
+      yield this.ctx.sessionProjections.register(this.permissionProjectionDefinition)
       this.autoAdmit = admit
       this.emitCatalogChanged()
-      return () => {
+      yield () => {
         this.autoAdmit = undefined
         this.emitCatalogChanged()
       }
-    }, 'permissionPresets.registerAuto()')
+    }.bind(this), 'permissionPresets.registerAuto()')
   }
 
   /**
@@ -326,7 +334,7 @@ export class PermissionPresetService extends TypertRemoteService {
   }
 
   private permissionState(session: Session): PermissionProjectionState {
-    const state = this.ctx.sessionProjections.stateOf(session, 'permissions')
+    const state = this.readPermissionState(session)
     if (state === undefined) throw new Error('permission: permissions session projection is not registered')
     return state
   }
