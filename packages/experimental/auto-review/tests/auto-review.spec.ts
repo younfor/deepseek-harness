@@ -130,7 +130,7 @@ function reasoningDecisionChunks(text: string): StreamChunk[] {
 async function harness(
   script: ReviewScript[],
   permissionConfig: NonNullable<Parameters<typeof PermissionPresetService.Config>[0]> = { presets: PRESETS, defaultPreset: 'workspace-write' },
-): Promise<{ ctx: Context; adapter: RecordingAdapter; auto: PluginFiber }> {
+): Promise<{ ctx: Context; adapter: RecordingAdapter; auto: PluginFiber; permission: PluginFiber }> {
   const ctx = new Context()
   provideWorkingDirectoryFixture(ctx)
   contexts.push(ctx)
@@ -146,11 +146,11 @@ async function harness(
     start() { throw new Error('auto-review tests do not execute shell requests') },
   })
   await ctx.plugin(ApprovalService, { policy: 'ask' })
-  await ctx.plugin(PermissionPresetService, permissionConfig)
+  const permission = await ctx.plugin(PermissionPresetService, permissionConfig)
   const adapter = new RecordingAdapter(script)
   ctx.llm.registerAdapter(['review'], adapter)
   const auto = await ctx.plugin(AutoReview)
-  return { ctx, adapter, auto }
+  return { ctx, adapter, auto, permission }
 }
 
 function agentFor(session: Session): Agent {
@@ -1376,14 +1376,16 @@ describe('cancellation and integration teardown', () => {
         arguments: {},
         agent,
       })
-      expect(afterClose).toMatchObject({ isError: false })
+      expect(afterClose).toMatchObject({
+        isError: true, error: { info: { code: TOOL_ABORTED_BEFORE_DISPATCH } },
+      })
       expect(adapter.requests).toHaveLength(1)
 
       release.resolve(undefined)
       const result = await pending
       await disposal
 
-      expect(probe.runs()).toBe(1)
+      expect(probe.runs()).toBe(0)
       expect(result).toMatchObject({
         isError: true,
         error: { info: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH } },
@@ -1513,6 +1515,114 @@ describe('cancellation and integration teardown', () => {
     expect(ctx.permissionPresets.names).toContain(AUTO_PRESET)
     expect(ctx.permissionPresets.current(session)).toBe('danger-full-access')
     await reinstalled.dispose()
+  })
+
+  it.each(['workspace-write', 'danger-full-access'])('keeps %s tool calls usable after permission provider replacement', async (preset) => {
+    const { ctx, adapter, permission } = await harness([])
+    const probe = registerProbe(ctx)
+    const session = ctx.sessions.create(SessionId(`permission-replacement-${preset}`))
+    ctx.permissionPresets.set(session, preset)
+    const agent = agentFor(session)
+    const run = (id: string) => ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId(id), name: 'probe', arguments: {}, agent,
+    })
+
+    await expect(run('before-replacement')).resolves.toMatchObject({ isError: false })
+    await permission.dispose()
+    const replacement = await ctx.plugin(PermissionPresetService, { presets: PRESETS, defaultPreset: 'workspace-write' })
+    await ctx.fiber.await()
+
+    expect(ctx.permissionPresets.names).toContain(AUTO_PRESET)
+    expect(ctx.permissionPresets.current(session)).toBe(preset)
+    expect(ctx.sessionProjections.snapshot(session).values).toHaveProperty('permissions')
+    await expect(run('after-replacement')).resolves.toMatchObject({ isError: false })
+    expect(probe.runs()).toBe(2)
+    expect(adapter.requests).toHaveLength(0)
+    await replacement.dispose()
+    expect(ctx.sessionProjections.snapshot(session).values).not.toHaveProperty('permissions')
+  })
+
+  it('still denies a reviewed call after provider replacement and explicit Auto reselection', async () => {
+    const { ctx, adapter, permission } = await harness([
+      decisionChunks('{"risk":"high","decision":"deny","reason":"fixture denial"}'),
+    ])
+    const probe = registerProbe(ctx)
+    const { session, agent } = autoSession(ctx, 'review-after-provider-replacement')
+    await permission.dispose()
+    await ctx.plugin(PermissionPresetService, { presets: PRESETS, defaultPreset: 'workspace-write' })
+    await ctx.fiber.await()
+    expect(ctx.permissionPresets.current(session)).toBe('danger-full-access')
+    ctx.permissionPresets.set(session, AUTO_PRESET)
+    setApprovalPolicy(session, 'never')
+    appendHeader(session, [{ name: 'probe', description: 'probe', parameters: { type: 'object' } }])
+    const callId = ToolCallId('denied-after-replacement')
+    appendAssistant(session, [{ type: 'tool-call', id: callId, name: 'probe', arguments: '{}' }])
+    appendNativeCall(session, callId, 'probe', '{}')
+
+    await expect(ctx.tools.execute({
+      signal: new AbortController().signal, callId, name: 'probe', arguments: {}, agent,
+    })).resolves.toMatchObject({ isError: true, error: { message: 'Auto review rejected tool "probe"; its body was not executed' } })
+    expect(adapter.requests).toHaveLength(1)
+    expect(probe.runs()).toBe(0)
+  })
+
+  it('removes Auto hooks when policy migration rejects during teardown', async () => {
+    const { ctx, auto } = await harness([])
+    const probe = registerProbe(ctx)
+    const { session, agent } = autoSession(ctx, 'failed-migration-cleanup')
+    const reports: unknown[] = []
+    ctx.logger.exporter({
+      export: (message: { type: string; args: readonly unknown[] }) => {
+        if (message.type === 'error') reports.push(...message.args)
+      },
+    })
+    const set = vi.spyOn(ctx.permissionPresets, 'set').mockImplementationOnce(() => {
+      throw new Error('fixture policy migration failed')
+    })
+
+    await auto.dispose()
+    expect(set).toHaveBeenCalledWith(session, 'danger-full-access')
+    expect(reports).toEqual(expect.arrayContaining([expect.objectContaining({ message: 'fixture policy migration failed' })]))
+    set.mockRestore()
+    expect(ctx.permissionPresets.names).not.toContain(AUTO_PRESET)
+    ctx.permissionPresets.set(session, 'workspace-write')
+    await expect(ctx.tools.execute({
+      signal: new AbortController().signal, callId: ToolCallId('after-failed-migration'),
+      name: 'probe', arguments: {}, agent,
+    })).resolves.toMatchObject({ isError: false })
+    expect(probe.runs()).toBe(1)
+  })
+
+  it('cancels a captured review hook invoked after its integration unloaded', async () => {
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    const { ctx, adapter, auto } = await harness([])
+    const probe = registerProbe(ctx)
+    const { session, agent } = autoSession(ctx, 'queued-before-integration-unload')
+    ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+      if (exec.name !== 'probe') return next()
+      entered.resolve(undefined)
+      await release.promise
+      return next()
+    }, { prepend: true })
+    const pending = ctx.tools.execute({
+      signal: new AbortController().signal, callId: ToolCallId('queued-review'),
+      name: 'probe', arguments: {}, agent,
+    })
+    await entered.promise
+    try {
+      await auto.dispose()
+      expect(ctx.permissionPresets.current(session)).toBe('danger-full-access')
+    } finally {
+      release.resolve(undefined)
+    }
+
+    await expect(pending).resolves.toMatchObject({
+      isError: true, error: { info: { code: TOOL_ABORTED_BEFORE_DISPATCH } },
+    })
+    expect(probe.runs()).toBe(0)
+    expect(adapter.requests).toHaveLength(0)
   })
 
   it('publishes Auto without validating the preset table at load', async () => {

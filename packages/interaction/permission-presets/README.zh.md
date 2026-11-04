@@ -86,7 +86,7 @@ kind: "package-reference"
 
 ### 读取侧与 `custom`
 
-`current(session)` 读取必需的 `permissions` 投影；该单元在组合默认值（`ctx.shell.sandboxMode` 与审批配置）之上折叠三个全量值旋钮事件。host 状态还会保留 `session/end-seed` 是否已经出现，使会话固定无需重扫日志即可区分显式为空的恢复 seed 与真正的新会话。仍匹配的最近选择在共享捆绑时胜出，已记录的 Auto 选择在 `never` 审批策略下也匹配；否则配置表中的第一个匹配项胜出；否则返回推导出的 `CUSTOM_PRESET`。投影 key 缺失时会显式失败。
+`current(session)` 读取必需的 `permissions` 投影；该单元在组合默认值（`ctx.shell.sandboxMode` 与审批配置）之上折叠三个全量值旋钮事件。host 状态还会保留 `session/end-seed` 是否已经出现，使会话固定无需重扫日志即可区分显式为空的恢复 seed 与真正的新会话。仍匹配的最近选择在共享捆绑时胜出，已记录的 Auto 选择在 `never` 审批策略下也匹配；否则配置表中的第一个匹配项胜出；否则返回推导出的 `CUSTOM_PRESET`。投影 key 缺失时会显式失败。读取会保留注册表引用，不再经由已退出的 provider 上下文解析；每个存活 Auto integration 会持有权限投影单元，直到其清理释放 contribution。
 
 `optionOf(name)` 返回配置条目、存活的 Auto 条目或仅供显示的 `custom` 条目。只有名称不匹配这三者时才抛错；已撤回的 Auto 条目不可用。
 

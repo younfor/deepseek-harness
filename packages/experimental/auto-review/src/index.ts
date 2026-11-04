@@ -686,11 +686,11 @@ export function apply(ctx: Context): void {
       if (agent === undefined || (exec.parent === undefined && exec.name === RUN_CODE_NAME)) {
         return next()
       }
-      if (permissionPresets.current(agent.session) !== AUTO_PRESET) {
-        return next()
-      }
       if (!accepting || lifecycle.signal.aborted) {
         return { kind: 'cancel' }
+      }
+      if (permissionPresets.current(agent.session) !== AUTO_PRESET) {
+        return next()
       }
 
       const completed = Promise.withResolvers<void>()
@@ -731,7 +731,15 @@ export function apply(ctx: Context): void {
         }
       } finally {
         lifecycle.abort(new Error('auto-review integration disposed'))
-        await Promise.allSettled([...active])
+        try {
+          await Promise.allSettled([...active])
+        } finally {
+          try {
+            await stopContribution()
+          } finally {
+            stopListener()
+          }
+        }
       }
     }
   }, 'auto-review lifecycle')
